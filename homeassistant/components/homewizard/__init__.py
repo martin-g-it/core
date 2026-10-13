@@ -1,5 +1,7 @@
 """The Homewizard integration."""
 
+from typing import cast
+
 from homewizard_energy import (
     HomeWizardEnergy,
     HomeWizardEnergyV1,
@@ -40,6 +42,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomeWizardConfigEntry) -
         await async_check_v2_support_and_create_issue(hass, entry)
 
     coordinator = HWEnergyDeviceUpdateCoordinator(hass, entry, api)
+
     try:
         await coordinator.async_config_entry_first_refresh()
 
@@ -53,7 +56,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomeWizardConfigEntry) -
 
     entry.runtime_data = coordinator
 
-    # Abort reauth config flow if active
+    # Abort reauth config flow if active.
     for progress_flow in hass.config_entries.flow.async_progress_by_handler(DOMAIN):
         if (
             "context" in progress_flow
@@ -69,19 +72,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomeWizardConfigEntry) -
             **create_main_device_info(coordinator),
         )
 
-    # Finalize
+    # Finalize.
     entry.async_on_unload(coordinator.api.close)
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Start real-time WebSocket measurements for API v2 P1 meters.
-    # Other HomeWizard devices continue to use HTTP polling.
+    # Start real-time WebSocket updates only for API v2 P1 meters.
+    # The coordinator uses HTTP only when WebSocket is unavailable.
+    # API v1 devices and other HomeWizard devices retain HTTP polling.
     if (
-        isinstance(api, HomeWizardEnergyV2)
+        entry.data.get(CONF_TOKEN)
         and coordinator.data.device.product_type == "HWE-P1"
     ):
         entry.async_create_background_task(
             hass,
-            coordinator.async_process_websocket_events(api),
+            coordinator.async_process_websocket_events(
+                cast(HomeWizardEnergyV2, api)
+            ),
             f"homewizard_websocket_{entry.entry_id}",
         )
 
@@ -117,13 +124,16 @@ async def async_check_v2_support_and_create_issue(
 ) -> None:
     """Check if the device supports v2 and create an issue if not."""
 
-    if not await has_v2_api(entry.data[CONF_IP_ADDRESS], async_get_clientsession(hass)):
+    if not await has_v2_api(
+        entry.data[CONF_IP_ADDRESS],
+        async_get_clientsession(hass),
+    ):
         return
 
     title = entry.title
 
-    # Try to get the name from the device registry
-    # This is to make it clearer if the user has renamed the device.
+    # Try to get the name from the device registry.
+    # This makes it clearer if the user has renamed the device.
     if main_device := get_main_device(hass, entry):
         device_name = main_device.name_by_user or main_device.name
 
