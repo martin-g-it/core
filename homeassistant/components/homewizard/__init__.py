@@ -73,6 +73,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomeWizardConfigEntry) -
     entry.async_on_unload(coordinator.api.close)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # Start real-time WebSocket measurements for API v2 P1 meters.
+    # Other HomeWizard devices continue to use HTTP polling.
+    if (
+        isinstance(api, HomeWizardEnergyV2)
+        and coordinator.data.device.product_type == "HWE-P1"
+    ):
+        entry.async_create_background_task(
+            hass,
+            coordinator.async_process_websocket_events(api),
+            f"homewizard_websocket_{entry.entry_id}",
+        )
+
     return True
 
 
@@ -84,7 +96,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: HomeWizardConfigEntry) 
 def get_main_device(
     hass: HomeAssistant, entry: HomeWizardConfigEntry
 ) -> dr.DeviceEntry | None:
-    """Helper function to get the main device for the config entry."""
+    """Helper function to get the device from the config entry."""
     device_registry = dr.async_get(hass)
     device_entries = dr.async_entries_for_config_entry(
         device_registry, config_entry_id=entry.entry_id
@@ -94,9 +106,7 @@ def get_main_device(
         return None
 
     # Get first device that is not a sub-device, as this is the
-    # main device in HomeWizard. This is relevant for the P1
-    # Meter which may create sub-devices for external utility
-    # meters.
+    # main device in the HomeWizard integration.
     return next(
         (device for device in device_entries if device.via_device_id is None), None
     )
@@ -113,9 +123,7 @@ async def async_check_v2_support_and_create_issue(
     title = entry.title
 
     # Try to get the name from the device registry
-    # This is to make it clearer which device needs
-    # reconfiguration, as the config entry title is kept default
-    # most of the time
+    # This is to make it clearer if the user has renamed the device.
     if main_device := get_main_device(hass, entry):
         device_name = main_device.name_by_user or main_device.name
 
