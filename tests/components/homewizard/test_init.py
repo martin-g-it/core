@@ -1,5 +1,6 @@
 """Tests for the homewizard component."""
 
+import asyncio
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 import weakref
@@ -357,3 +358,88 @@ async def test_main_device_registered_before_platform_forwarding(
     )
     assert gas_meter_device is not None
     assert gas_meter_device.via_device_id == main_device.id
+
+
+@pytest.mark.parametrize("device_fixture", ["HWE-P1"])
+async def test_websocket_task_cancelled_on_reload_and_unload(
+    hass: HomeAssistant,
+    mock_config_entry_v2: MockConfigEntry,
+    mock_homewizardenergy_v2: MagicMock,
+) -> None:
+    """Test reloading cancels the old P1 WebSocket task."""
+    mock_config_entry_v2.add_to_hass(hass)
+
+    started: asyncio.Queue[int] = asyncio.Queue()
+    cancelled: asyncio.Queue[int] = asyncio.Queue()
+    next_connection_id = 0
+
+    async def mock_websocket_loop(self, api) -> None:
+        """Wait until the config entry cancels the background task."""
+        nonlocal next_connection_id
+        next_connection_id += 1
+        connection_id = next_connection_id
+        started.put_nowait(connection_id)
+
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.put_nowait(connection_id)
+
+    with patch(
+        "homeassistant.components.homewizard.coordinator."
+        "HWEnergyDeviceUpdateCoordinator.async_process_websocket_events",
+        new=mock_websocket_loop,
+    ):
+        assert await hass.config_entries.async_setup(mock_config_entry_v2.entry_id)
+        assert await asyncio.wait_for(started.get(), timeout=5) == 1
+        assert mock_config_entry_v2.state is ConfigEntryState.LOADED
+
+        assert await hass.config_entries.async_reload(mock_config_entry_v2.entry_id)
+        assert await asyncio.wait_for(cancelled.get(), timeout=5) == 1
+        assert await asyncio.wait_for(started.get(), timeout=5) == 2
+        assert next_connection_id == 2
+
+        assert await hass.config_entries.async_unload(mock_config_entry_v2.entry_id)
+        assert await asyncio.wait_for(cancelled.get(), timeout=5) == 2
+        assert mock_config_entry_v2.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_no_websocket_for_api_v1(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_homewizardenergy: MagicMock,
+) -> None:
+    """Test API v1 devices do not start WebSocket tasks."""
+    mock_config_entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.homewizard.coordinator."
+        "HWEnergyDeviceUpdateCoordinator.async_process_websocket_events"
+    ) as mock_websocket:
+        assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+        assert mock_config_entry.state is ConfigEntryState.LOADED
+        mock_websocket.assert_not_called()
+
+        assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+
+
+@pytest.mark.parametrize("device_fixture", ["HWE-KWH1"])
+async def test_no_websocket_for_non_p1_v2_device(
+    hass: HomeAssistant,
+    mock_config_entry_v2: MockConfigEntry,
+    mock_homewizardenergy_v2: MagicMock,
+) -> None:
+    """Test non-P1 API v2 devices do not start WebSocket tasks."""
+    mock_config_entry_v2.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.homewizard.coordinator."
+        "HWEnergyDeviceUpdateCoordinator.async_process_websocket_events"
+    ) as mock_websocket:
+        assert await hass.config_entries.async_setup(mock_config_entry_v2.entry_id)
+        await hass.async_block_till_done()
+        assert mock_config_entry_v2.state is ConfigEntryState.LOADED
+        mock_websocket.assert_not_called()
+
+        assert await hass.config_entries.async_unload(mock_config_entry_v2.entry_id)
