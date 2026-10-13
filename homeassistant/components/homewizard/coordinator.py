@@ -1,5 +1,6 @@
 """Update coordinator for HomeWizard."""
 
+import asyncio
 from dataclasses import replace
 from typing import override
 
@@ -27,6 +28,10 @@ from .const import (
 
 type HomeWizardConfigEntry = ConfigEntry[HWEnergyDeviceUpdateCoordinator]
 
+WEBSOCKET_TIMEOUT = 30
+WEBSOCKET_RECONNECT_DELAY = 5
+WEBSOCKET_MAX_RECONNECT_DELAY = 30
+
 
 class HWEnergyDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceResponseEntry]):
     """Gather data for the energy device."""
@@ -51,29 +56,72 @@ class HWEnergyDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceResponseEntry]
             update_interval=UPDATE_INTERVAL,
         )
         self.api = api
+        self._websocket_active = False
 
     async def async_process_websocket_events(
         self,
         api: HomeWizardEnergyV2,
     ) -> None:
-        """Process real-time measurements from a HomeWizard v2 device."""
-        async with api.websocket() as websocket:
-            await websocket.subscribe(WebSocketTopic.MEASUREMENT)
+        """Receive real-time measurements with automatic reconnection."""
+        reconnect_delay = WEBSOCKET_RECONNECT_DELAY
 
-            async for event in websocket.events_typed():
-                if (
-                    event.type != WebSocketTopic.MEASUREMENT
-                    or not isinstance(event.data, Measurement)
-                    or self.data is None
-                ):
-                    continue
+        while True:
+            try:
+                async with api.websocket() as websocket:
+                    await websocket.subscribe(WebSocketTopic.MEASUREMENT)
 
-                updated_data = replace(
-                    self.data,
-                    measurement=event.data,
+                    LOGGER.debug(
+                        "HomeWizard WebSocket connected for %s",
+                        self.config_entry.title,
+                    )
+
+                    events = websocket.events_typed()
+
+                    while True:
+                        async with asyncio.timeout(WEBSOCKET_TIMEOUT):
+                            event = await anext(events)
+
+                        if (
+                            event.type != WebSocketTopic.MEASUREMENT
+                            or not isinstance(event.data, Measurement)
+                            or self.data is None
+                        ):
+                            continue
+
+                        self._websocket_active = True
+                        reconnect_delay = WEBSOCKET_RECONNECT_DELAY
+
+                        updated_data = replace(
+                            self.data,
+                            measurement=event.data,
+                        )
+
+                        self.async_set_updated_data(updated_data)
+
+            except asyncio.CancelledError:
+                raise
+
+            except (RequestError, OSError, TimeoutError) as err:
+                LOGGER.debug(
+                    "HomeWizard WebSocket connection lost for %s: %s",
+                    self.config_entry.title,
+                    err,
                 )
 
-                self.async_set_updated_data(updated_data)
+            finally:
+                self._websocket_active = False
+
+            LOGGER.debug(
+                "Reconnecting HomeWizard WebSocket for %s in %s seconds",
+                self.config_entry.title,
+                reconnect_delay,
+            )
+
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(
+                reconnect_delay * 2,
+                WEBSOCKET_MAX_RECONNECT_DELAY,
+            )
 
     def _update_battery_mode_cloud_repair_issue(
         self, data: DeviceResponseEntry
@@ -87,7 +135,8 @@ class HWEnergyDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceResponseEntry]
         )
         issue_id = battery_mode_cloud_issue_id(self.config_entry.entry_id)
         issue_exists = (
-            ir.async_get(self.hass).async_get_issue(DOMAIN, issue_id) is not None
+            ir.async_get(self.hass).async_get_issue(DOMAIN, issue_id)
+            is not None
         )
         if battery_mode_cloud_issue_active and not issue_exists:
             ir.async_create_issue(
@@ -111,29 +160,41 @@ class HWEnergyDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceResponseEntry]
 
         except RequestError as ex:
             raise UpdateFailed(
-                translation_domain=DOMAIN, translation_key="communication_error"
+                translation_domain=DOMAIN,
+                translation_key="communication_error",
             ) from ex
 
         except DisabledError as ex:
             if not self.api_disabled:
                 self.api_disabled = True
 
-                # Do not reload when performing first refresh
+                # Do not reload when performing first refresh.
                 if self.data is not None:
                     # Reload config entry to let init flow handle
-                    # retrying and trigger repair flow
+                    # retrying and trigger repair flow.
                     self.hass.config_entries.async_schedule_reload(
                         self.config_entry.entry_id
                     )
 
             raise UpdateFailed(
-                translation_domain=DOMAIN, translation_key="api_disabled"
+                translation_domain=DOMAIN,
+                translation_key="api_disabled",
             ) from ex
 
         except UnauthorizedError as ex:
             raise ConfigEntryAuthFailed from ex
 
         self.api_disabled = False
+
+        # Keep WebSocket measurements authoritative while connected.
+        # HTTP continues to refresh device, state, system and batteries.
+        # When the WebSocket is unavailable, HTTP measurements are used.
+        if self._websocket_active and self.data is not None:
+            data = replace(
+                data,
+                measurement=self.data.measurement,
+            )
+
         self._update_battery_mode_cloud_repair_issue(data)
 
         self.data = data
