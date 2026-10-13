@@ -3,7 +3,7 @@
 import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from homewizard_energy import WebSocketTopic
 from homewizard_energy.models import CombinedModels
@@ -13,6 +13,7 @@ from homeassistant.components.homewizard.coordinator import (
     HWEnergyDeviceUpdateCoordinator,
 )
 from homeassistant.core import HomeAssistant
+
 from tests.common import MockConfigEntry
 
 
@@ -38,8 +39,13 @@ async def test_websocket_measurement_update(
     )
 
     websocket = MagicMock()
-    websocket.__aenter__.return_value = websocket
-    api.websocket.return_value = websocket
+    websocket.subscribe = AsyncMock()
+
+    context_manager = MagicMock()
+    context_manager.__aenter__ = AsyncMock(return_value=websocket)
+    context_manager.__aexit__ = AsyncMock(return_value=None)
+
+    api.websocket.return_value = context_manager
 
     received = asyncio.Event()
 
@@ -106,13 +112,19 @@ async def test_http_does_not_overwrite_websocket_measurements(
 
     api.combined.return_value = replace(
         original,
-        measurement=replace(original.measurement, power_w=900.0),
+        measurement=replace(
+            original.measurement,
+            power_w=900.0,
+        ),
     )
 
     result = await coordinator._async_update_data()
 
     assert result.measurement.power_w == 1500.0
     assert result.device == original.device
+    assert result.system == original.system
+    assert result.state == original.state
+    assert result.batteries == original.batteries
 
 
 async def test_http_fallback_when_websocket_disconnected(
@@ -132,16 +144,25 @@ async def test_http_fallback_when_websocket_disconnected(
 
     coordinator.data = replace(
         original,
-        measurement=replace(original.measurement, power_w=1500.0),
+        measurement=replace(
+            original.measurement,
+            power_w=1500.0,
+        ),
     )
     coordinator._websocket_active = False
 
     api.combined.return_value = replace(
         original,
-        measurement=replace(original.measurement, power_w=900.0),
+        measurement=replace(
+            original.measurement,
+            power_w=900.0,
+        ),
     )
 
     result = await coordinator._async_update_data()
 
     assert result.measurement.power_w == 900.0
     assert result.device == original.device
+    assert result.system == original.system
+    assert result.state == original.state
+    assert result.batteries == original.batteries
