@@ -1,10 +1,15 @@
 """Update coordinator for HomeWizard."""
 
+from dataclasses import replace
 from typing import override
 
-from homewizard_energy import HomeWizardEnergy
+from homewizard_energy import HomeWizardEnergy, HomeWizardEnergyV2, WebSocketTopic
 from homewizard_energy.errors import DisabledError, RequestError, UnauthorizedError
-from homewizard_energy.models import Batteries, CombinedModels as DeviceResponseEntry
+from homewizard_energy.models import (
+    Batteries,
+    CombinedModels as DeviceResponseEntry,
+    Measurement,
+)
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -46,6 +51,29 @@ class HWEnergyDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceResponseEntry]
             update_interval=UPDATE_INTERVAL,
         )
         self.api = api
+
+    async def async_process_websocket_events(
+        self,
+        api: HomeWizardEnergyV2,
+    ) -> None:
+        """Process real-time measurements from a HomeWizard v2 device."""
+        async with api.websocket() as websocket:
+            await websocket.subscribe(WebSocketTopic.MEASUREMENT)
+
+            async for event in websocket.events_typed():
+                if (
+                    event.type != WebSocketTopic.MEASUREMENT
+                    or not isinstance(event.data, Measurement)
+                    or self.data is None
+                ):
+                    continue
+
+                updated_data = replace(
+                    self.data,
+                    measurement=event.data,
+                )
+
+                self.async_set_updated_data(updated_data)
 
     def _update_battery_mode_cloud_repair_issue(
         self, data: DeviceResponseEntry
