@@ -3,9 +3,10 @@
 import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from homewizard_energy import WebSocketTopic
+from homewizard_energy.errors import RequestError
 from homewizard_energy.models import CombinedModels
 import pytest
 
@@ -166,3 +167,101 @@ async def test_http_fallback_when_websocket_disconnected(
     assert result.system == original.system
     assert result.state == original.state
     assert result.batteries == original.batteries
+
+
+async def test_websocket_reconnect_resubscribes(
+    hass: HomeAssistant,
+    mock_config_entry_v2: MockConfigEntry,
+    mock_homewizardenergy_v2: MagicMock,
+) -> None:
+    """Test reconnect restores the WebSocket measurement subscription."""
+    mock_config_entry_v2.add_to_hass(hass)
+
+    api = mock_homewizardenergy_v2
+    original = api.combined.return_value
+
+    coordinator = HWEnergyDeviceUpdateCoordinator(
+        hass, mock_config_entry_v2, api
+    )
+    coordinator.async_set_updated_data(original)
+
+    first_measurement = replace(
+        original.measurement,
+        power_w=100.0,
+    )
+    second_measurement = replace(
+        original.measurement,
+        power_w=200.0,
+    )
+
+    received = asyncio.Event()
+
+    async def first_events():
+        yield SimpleNamespace(
+            type=WebSocketTopic.MEASUREMENT,
+            data=first_measurement,
+        )
+        raise RequestError("Simulated WebSocket disconnect")
+
+    async def second_events():
+        yield SimpleNamespace(
+            type=WebSocketTopic.MEASUREMENT,
+            data=second_measurement,
+        )
+        received.set()
+        await asyncio.Future()
+
+    def make_context_manager(events):
+        websocket = MagicMock()
+        websocket.subscribe = AsyncMock()
+        websocket.events_typed.return_value = events
+
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=websocket)
+        context.__aexit__ = AsyncMock(return_value=None)
+
+        return context, websocket
+
+    first_context, first_ws = make_context_manager(
+        first_events()
+    )
+    second_context, second_ws = make_context_manager(
+        second_events()
+    )
+
+    api.websocket.side_effect = [
+        first_context,
+        second_context,
+    ]
+
+    with patch(
+        "homeassistant.components.homewizard.coordinator.asyncio.sleep",
+        new_callable=AsyncMock,
+    ) as mock_sleep:
+        task = asyncio.create_task(
+            coordinator.async_process_websocket_events(api)
+        )
+
+        try:
+            await asyncio.wait_for(received.wait(), timeout=5)
+
+            assert api.websocket.call_count == 2
+
+            first_ws.subscribe.assert_awaited_once_with(
+                WebSocketTopic.MEASUREMENT
+            )
+            second_ws.subscribe.assert_awaited_once_with(
+                WebSocketTopic.MEASUREMENT
+            )
+
+            assert coordinator.data.measurement.power_w == 200.0
+            assert coordinator._websocket_active
+
+            mock_sleep.assert_awaited_once_with(5)
+
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    assert not coordinator._websocket_active
